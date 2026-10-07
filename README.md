@@ -147,7 +147,7 @@ Both tracks are always recorded separately, and each is levelled to the same spe
 ## How it works
 
 - **Recording.** The mic (`@DEFAULT_SOURCE@`) and the monitor of the default output (`@DEFAULT_MONITOR@`) are captured with `parec`. Because it follows the default output, switching to a headset during a call keeps working. `ffmpeg` encodes the audio to Opus when you stop.
-- **Transcription.** After the call both tracks are mixed and transcribed in one pass with whisper-rs, using the `large-v3-turbo` model unless you pick another, so there is a single timeline. Long silences are skipped, which keeps whisper from inventing text in them, and word times come from whisper's attention alignment (DTW).
+- **Transcription.** After the call both tracks are transcribed with whisper-rs, using the `large-v3-turbo` model unless you pick another, so there is a single timeline. Long silences are skipped, which keeps whisper from inventing text in them, and word times come from whisper's attention alignment (DTW). With [remote transcription](#remote-transcription) the same two tracks are sent to a whisper server on your network instead, and the model is not loaded here.
 - **Who said what.** The mic and the computer audio are transcribed one at a time, so the side of each line is simply its track, and two people talking at once, or someone talking over music, are both kept. Through speakers the other side leaks into your mic; the app leaves out what is only that echo, also when it is loud enough to be heard as a voice of its own: a voice on the mic that only speaks while the computer audio does is echo. When several voices share one side, a colleague next to you or three people on the other end, they are told apart as well (see below): "You 1", "You 2" and "Remote 1", "Remote 2" and so on, each with its own name field.
 - **Imported files.** A single audio file has no second track to tell the speakers apart, so the voices themselves are told apart with NVIDIA's [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), run locally through ONNX Runtime. It follows up to eight speakers, also when they talk at the same time, and numbers them "Speaker 1", "Speaker 2" and so on in the order they first speak. The number of speakers is found automatically (voices heard for only a few seconds are folded into the nearest real speaker) or can be fixed. A sentence always goes to one speaker as a whole. Similar voices and fast back-and-forth can still land on the wrong speaker, which the swap-speaker button fixes per line.
 - **Chapters.** The recorder runs `omarchy-default-agent`'s agent headless and with every tool switched off, in an empty working directory, bounded in time and size. Agents that cannot run without tools are not used.
@@ -169,6 +169,42 @@ The command-line `transcribe` and `transcribe-file` take `--model` instead. When
 
 The app looks for `ggml-<model>.bin`, for instance `ggml-large-v3-turbo.bin`, in `~/.local/share/omarchy-meeting-recorder/models/`. If you use [voxtype](https://voxtype.io) and it already downloaded that model to `~/.local/share/voxtype/models/`, that copy is used. Otherwise it is downloaded (about 1.6 GB for `large-v3-turbo`) from [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp). Finding speakers downloads the speaker model on first use (about 120 MB) to `nemotron-3-diarization/` in the same directory: the int8 ONNX export of Nemotron 3 Diarization from the [Hugging Face ONNX community](https://huggingface.co/onnx-community/Nemotron-3-Diarization-ONNX), pinned to one revision. The model is NVIDIA's, under the [OpenMDW license](https://huggingface.co/nvidia/Nemotron-3-Diarization). ONNX Runtime is compiled into the binary, so nothing else is needed at runtime.
 
+To run the speech model on another machine instead, see [Remote transcription](#remote-transcription).
+
+### Remote transcription
+
+Recording stays on this laptop. Transcription stays here too, until you opt in. With the block below in `~/.config/omarchy-meeting-recorder/config.toml`, the audio of each meeting is sent to a machine on your LAN and transcribed there. Put these keys at the top of the file, with `model`, before any `[[action]]` table:
+
+```toml
+transcription = "remote"
+transcription_url = "http://192.168.1.20:8080"
+# optional. OpenAI-compatible servers usually require a model name.
+# whisper.cpp's /inference ignores it.
+# transcription_model = "whisper-1"
+# optional bearer token, sent as Authorization: Bearer ...
+# transcription_api_key = "secret"
+```
+
+`transcription = "remote"` needs `transcription_url`. A url on its own is enough too: remote is inferred from it. `transcription = "local"` keeps whisper on this computer even when a url is still in the file. `--model` on the command line does the same for that one run, so a local model can still be forced.
+
+The microphone and the computer audio are still two requests, so lines stay **You** and **Remote** (and You 1 / Remote 1 when several voices share a side; that part still runs on the laptop and can download the speaker model). Word times are used when the server returns them. whisper.cpp does, for `verbose_json`. A server that answers with text and no timestamps still produces a timeline: one block per track, stretched across the speech in that track.
+
+The laptop gives up after 10 seconds when the host does not accept a connection, and otherwise after at least 3 minutes and at most 45 minutes (about four times the length of the audio). The done page shows `Transcription failed: …`, and `transcribe` / `transcribe-file` print the same error.
+
+On the stronger machine, build [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and run its HTTP server. The default bind is localhost, which this laptop cannot reach, so listen on the LAN:
+
+```bash
+./build/bin/whisper-server \
+  -m models/ggml-large-v3-turbo.bin \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -l auto
+```
+
+The url in the config is `http://<that-machine>:8080` (the app posts to `/inference`). An OpenAI-compatible server is the full path instead, for example `http://192.168.1.20:8000/v1/audio/transcriptions`. `https://` works when the laptop trusts the certificate; on a home LAN, `http://` is the usual setup, and the audio crosses the network unencrypted. Anything that can open the port can send audio to the model, so keep the server on the LAN.
+
+While remote is configured, the start screen does not ask you to download a local ggml model. The speaker model is separate and still local.
+
 ## Actions
 
 Your own scripts, picked from the **Actions** menu on the done page: store the transcript in Obsidian, publish it, mail it around. Each is a name and a command in `~/.config/omarchy-meeting-recorder/config.toml`; the command gets the meeting folder and the meeting's details, and what it prints last shows up in the app, with an **Open** button for a link.
@@ -183,7 +219,7 @@ Your own scripts, picked from the **Actions** menu on the done page: store the t
 
 ## Privacy
 
-The audio, the transcript and everything else stay on your computer. The only thing that leaves it is the transcript text for the chapters, and only when you have set a default agent: it goes to that agent's service, the one you already chose and pay for. No agent, no chapters, nothing sent. Actions are yours: they send whatever your scripts send, and only when you pick one.
+With the default settings, the audio and the transcript stay on your computer. Remote transcription is opt-in: once `transcription_url` is set, the audio of each meeting is sent to that host. See [Remote transcription](#remote-transcription). Chapter text leaves the computer only when you have set a default agent, and only to that agent's service. With remote transcription left unset and no agent, nothing is sent. Actions send whatever your scripts send, and only when you pick one.
 
 ## Requirements
 
@@ -277,7 +313,7 @@ omarchy-meeting-recorder transcribe mic.ogg computer.ogg --language en > transcr
 omarchy-meeting-recorder transcribe-file interview.mp3 --speakers 2 > transcript.md
 ```
 
-Any format ffmpeg can read works. `--language` takes `auto` (the default), `en`, `nl`, `de`, `fr`, `es`, `it` or `pt`.
+Any format ffmpeg can read works. `--language` takes `auto` (the default), `en`, `nl`, `de`, `fr`, `es`, `it` or `pt`. When `config.toml` sets a [remote server](#remote-transcription), `transcribe` and `transcribe-file` use it. `--model` forces the local ggml model for that run.
 
 ## The screenshots
 

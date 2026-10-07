@@ -2118,7 +2118,7 @@ impl Recorder {
                 .collect();
             markdown = meeting::relabel_all(&markdown, &renames);
             manifest.language = language.to_owned();
-            manifest.model = Some(crate::models::configured());
+            manifest.model = Some(crate::models::active_model_label());
             manifest.title = self.title();
             // Chapters of a previous transcript would point at lines that are gone.
             manifest.chapters.clear();
