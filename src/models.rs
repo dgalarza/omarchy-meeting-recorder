@@ -5,6 +5,9 @@
 //! `large-v3-turbo` otherwise. A name from `MODELS` is looked for in the app's
 //! own model folder and in voxtype's (same files, no need to have them twice),
 //! and downloaded when it is in neither. A path to a `.bin` file is used as is.
+//!
+//! Remote transcription is opt-in in that same file (`transcription_url`, or
+//! `transcription = "remote"`). `--model` forces the local model for that run.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -95,6 +98,149 @@ pub fn config_file() -> PathBuf {
         .join("config.toml")
 }
 
+/// Where speech-to-text runs. Local is the default; remote is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transcription {
+    Local,
+    Remote(Remote),
+}
+
+/// A whisper.cpp server, or an OpenAI-compatible `/v1/audio/transcriptions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// What was written in the config: a base URL, or the full endpoint.
+    pub url: String,
+    pub api_key: Option<String>,
+    /// Sent as the `model` form field. whisper.cpp's `/inference` ignores it.
+    pub model: String,
+}
+
+/// Local unless the config opts into a remote server. `--model` forces local.
+pub fn transcription() -> Result<Transcription, String> {
+    let force_local = OVERRIDE.lock().unwrap().is_some();
+    let text = std::fs::read_to_string(config_file()).unwrap_or_default();
+    resolve(force_local, &text)
+}
+
+fn resolve(force_local: bool, text: &str) -> Result<Transcription, String> {
+    if force_local {
+        return Ok(Transcription::Local);
+    }
+    parse_transcription(text)
+}
+
+/// Top-level keys only: a `[[action]]` table must not be able to switch this.
+fn parse_transcription(text: &str) -> Result<Transcription, String> {
+    let values = top_level_values(text);
+    let mode = values
+        .get("transcription")
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let url = values
+        .get("transcription_url")
+        .cloned()
+        .filter(|value| !value.is_empty());
+    let api_key = values
+        .get("transcription_api_key")
+        .cloned()
+        .filter(|value| !value.is_empty());
+    let model = values
+        .get("transcription_model")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "whisper-1".to_owned());
+    if let Some(key) = &api_key
+        && key.chars().any(char::is_control)
+    {
+        return Err("transcription_api_key cannot contain a line break".into());
+    }
+    let url = match mode.as_deref() {
+        Some("local") => return Ok(Transcription::Local),
+        Some("remote") => url.ok_or_else(|| {
+            "transcription = \"remote\" needs transcription_url in config.toml".to_owned()
+        })?,
+        Some(other) => {
+            return Err(format!(
+                "transcription must be \"local\" or \"remote\", not \"{other}\""
+            ));
+        }
+        None => match url {
+            Some(url) => url,
+            None => return Ok(Transcription::Local),
+        },
+    };
+    let url = url.trim().trim_end_matches('/').to_owned();
+    crate::remote::endpoint(&url)?;
+    Ok(Transcription::Remote(Remote {
+        url,
+        api_key,
+        model,
+    }))
+}
+
+/// `key = "value"` pairs before the first `[table]`. `#` starts a comment
+/// outside quotes. The same line style as the rest of this file.
+fn top_level_values(text: &str) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_table = true;
+            continue;
+        }
+        if in_table {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        values.insert(key.to_owned(), unquote(value));
+    }
+    values
+}
+
+/// A TOML string: `"..."` with backslash escapes, or `'...'` taken literally.
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.split('\'').next()) {
+        return inner.trim().to_owned();
+    }
+    let Some(rest) = value.strip_prefix('"') else {
+        return value.split('#').next().unwrap_or("").trim().to_owned();
+    };
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// What a meeting file should record: the remote url, or the local model name.
+pub fn active_model_label() -> String {
+    match transcription() {
+        Ok(Transcription::Remote(remote)) => format!("remote:{}", remote.url),
+        _ => configured(),
+    }
+}
+
 /// The configured model: a name from `MODELS` or a path to a model file.
 pub fn configured() -> String {
     if let Some(name) = OVERRIDE.lock().unwrap().clone() {
@@ -154,7 +300,12 @@ pub fn find() -> Option<PathBuf> {
 }
 
 /// For the app: the model's name and its size when it still has to be downloaded.
+/// Remote transcription does not need a ggml file on this machine.
 pub fn missing() -> Option<(String, u32)> {
+    match transcription() {
+        Ok(Transcription::Local) => {}
+        Ok(Transcription::Remote(_)) | Err(_) => return None,
+    }
     if find().is_some() {
         return None;
     }
@@ -206,5 +357,105 @@ mod tests {
         assert_eq!(known("large-v3").map(|m| m.name), Some("large-v3"));
         assert_eq!(known("ggml-small.en.bin").map(|m| m.name), Some("small.en"));
         assert!(known("gpt-5").is_none());
+    }
+
+    #[test]
+    fn remote_stays_off_until_a_url_is_set() {
+        assert_eq!(
+            parse_transcription("model = \"small\"\n").unwrap(),
+            Transcription::Local
+        );
+        assert_eq!(parse_transcription("").unwrap(), Transcription::Local);
+        assert_eq!(
+            parse_transcription("transcription = \"local\"\ntranscription_url = \"not a url\"\n")
+                .unwrap(),
+            Transcription::Local
+        );
+    }
+
+    #[test]
+    fn a_url_turns_transcription_remote() {
+        let remote = match parse_transcription(
+            r#"
+            model = "small" # still the local name, unused while remote is on
+            transcription_url = "http://10.0.0.8:8080/" # lab machine
+            transcription_api_key = "tok#en"
+            transcription_model = "large-v3"
+            "#,
+        )
+        .unwrap()
+        {
+            Transcription::Remote(remote) => remote,
+            Transcription::Local => panic!("expected remote"),
+        };
+        assert_eq!(remote.url, "http://10.0.0.8:8080");
+        assert_eq!(remote.api_key.as_deref(), Some("tok#en"));
+        assert_eq!(remote.model, "large-v3");
+    }
+
+    #[test]
+    fn remote_without_a_url_is_an_error() {
+        let err = parse_transcription("transcription = \"remote\"\n").unwrap_err();
+        assert!(err.contains("transcription_url"), "{err}");
+        let err = parse_transcription("transcription = \"cloud\"\n").unwrap_err();
+        assert!(err.contains("local"), "{err}");
+        let err = parse_transcription("transcription_url = \"10.0.0.8:8080\"\n").unwrap_err();
+        assert!(err.contains("http://"), "{err}");
+    }
+
+    #[test]
+    fn an_action_table_cannot_switch_transcription() {
+        let text = r#"
+transcription_url = "http://10.0.0.8:8080"
+
+[[action]]
+name = "x"
+command = "y"
+transcription = "local"
+transcription_url = "http://10.9.9.9:1"
+"#;
+        match parse_transcription(text).unwrap() {
+            Transcription::Remote(remote) => {
+                assert_eq!(remote.url, "http://10.0.0.8:8080");
+                assert_eq!(remote.model, "whisper-1");
+            }
+            Transcription::Local => panic!("the action table turned transcription off"),
+        }
+    }
+
+    fn model_default(text: &str) -> String {
+        match parse_transcription(text).unwrap() {
+            Transcription::Remote(remote) => remote.model,
+            Transcription::Local => String::new(),
+        }
+    }
+
+    #[test]
+    fn omitted_remote_model_defaults_to_whisper_1() {
+        assert_eq!(
+            model_default("transcription_url = \"http://10.0.0.8:8080\"\n"),
+            "whisper-1"
+        );
+    }
+
+    #[test]
+    fn openai_url_is_accepted() {
+        let text = "transcription = \"Remote\"\ntranscription_url = \"http://10.0.0.8:8000/v1/audio/transcriptions\"\n";
+        match parse_transcription(text).unwrap() {
+            Transcription::Remote(remote) => {
+                assert_eq!(remote.url, "http://10.0.0.8:8000/v1/audio/transcriptions");
+            }
+            Transcription::Local => panic!("expected remote"),
+        }
+    }
+
+    #[test]
+    fn a_model_override_forces_local_even_when_the_file_says_remote() {
+        let text = "transcription_url = \"http://10.0.0.8:8080\"\n";
+        assert_eq!(resolve(true, text).unwrap(), Transcription::Local);
+        assert!(matches!(
+            resolve(false, text).unwrap(),
+            Transcription::Remote(_)
+        ));
     }
 }

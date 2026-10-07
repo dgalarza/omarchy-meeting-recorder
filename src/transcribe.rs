@@ -1,11 +1,10 @@
 //! Transcription after the meeting, in-process with whisper.cpp (whisper-rs).
 //!
-//! Both tracks are mixed and transcribed in one pass, so there is one timeline
-//! and nothing to merge. The speaker of every phrase is then read off the two
-//! tracks, like whisper.cpp's `--diarize`: where the mic carries more energy it
-//! is "You", where the computer audio does it is "Remote". Echo of the other
-//! side in the mic (no headset) is always quieter than the original, so it does
-//! not turn into a line of its own.
+//! Both tracks are transcribed one at a time, so there is one timeline and the
+//! side of a line is its track. Echo of the other side in the mic (no headset)
+//! is always quieter than the original, so it does not turn into a line of its
+//! own. With `transcription_url` set, those same passes are sent to a whisper
+//! server on the network (`remote`) instead of loading a ggml model here.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -553,6 +552,22 @@ pub fn download(
 // ---------------------------------------------------------------------------
 // Transcription
 
+/// When a remote server is configured, fail before the long local work if it
+/// does not answer. Unset remote leaves the local path untouched.
+fn prepare(events: &Events, abort: &Abort) -> Result<(), String> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    let crate::models::Transcription::Remote(remote) = crate::models::transcription()? else {
+        return Ok(());
+    };
+    emit(
+        events,
+        Event::Stage("Checking the transcription server".into()),
+    );
+    crate::remote::check_reachable(&remote, abort)
+}
+
 /// Transcribes the meeting. `language` is a whisper code or "auto".
 pub fn transcribe(
     mic: &[f32],
@@ -561,6 +576,7 @@ pub fn transcribe(
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
+    prepare(events, abort)?;
     let duration_secs = (mic.len().max(computer.len()) / WHISPER_RATE) as i64;
     let empty = |language: &str| Transcript {
         segments: Vec::new(),
@@ -599,7 +615,7 @@ pub fn transcribe(
         &active_frames(&computer, computer.len().div_ceil(FRAME)),
     );
     let remote = voices(&computer, events, abort)?;
-    let context = load_whisper(events, abort)?;
+    let engine = load_engine(events, abort)?;
 
     let length = |regions: &[Region]| regions.iter().map(|r| r.end - r.start).sum::<usize>();
     let total = (length(&mic_regions) + length(&computer_regions)).max(1) as f64;
@@ -624,7 +640,7 @@ pub fn transcribe(
         }
         let share = length(regions) as f64 / total;
         let (lines, found) = side_pass(
-            &context,
+            &engine,
             track,
             regions,
             speakers,
@@ -872,6 +888,7 @@ pub fn transcribe_single(
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
+    prepare(events, abort)?;
     let duration_secs = (track.len() / WHISPER_RATE) as i64;
     let empty = || Transcript {
         segments: Vec::new(),
@@ -919,9 +936,9 @@ fn whisper_pass(
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
-    let context = load_whisper(events, abort)?;
+    let engine = load_engine(events, abort)?;
     let (segments, detected) = side_pass(
-        &context,
+        &engine,
         mixed,
         regions,
         speakers,
@@ -941,6 +958,25 @@ fn whisper_pass(
         },
         duration_secs,
     })
+}
+
+enum Engine {
+    Local(WhisperContext),
+    Remote(crate::models::Remote),
+}
+
+/// Local loads ggml, as before. Remote keeps the model on the other machine.
+fn load_engine(events: &Events, abort: &Abort) -> Result<Engine, String> {
+    match crate::models::transcription()? {
+        crate::models::Transcription::Local => Ok(Engine::Local(load_whisper(events, abort)?)),
+        crate::models::Transcription::Remote(remote) => {
+            if abort.load(Ordering::Relaxed) {
+                return Err(CANCELLED.into());
+            }
+            emit(events, Event::Stage("Using remote transcription".into()));
+            Ok(Engine::Remote(remote))
+        }
+    }
 }
 
 fn load_whisper(events: &Events, abort: &Abort) -> Result<WhisperContext, String> {
@@ -970,7 +1006,7 @@ fn load_whisper(events: &Events, abort: &Abort) -> Result<WhisperContext, String
 /// Progress runs from `progress.0` to `progress.1`.
 #[allow(clippy::too_many_arguments)]
 fn side_pass(
-    context: &WhisperContext,
+    engine: &Engine,
     track: &[f32],
     regions: &[Region],
     speakers: &Speakers,
@@ -982,8 +1018,14 @@ fn side_pass(
 ) -> Result<(Vec<Segment>, Option<String>), String> {
     let glued = Glued::new(track, regions);
     emit(events, Event::Stage("Transcribing".into()));
-    let (words, detected) =
-        run_whisper(context, &glued, speakers, language, progress, events, abort)?;
+    let (words, detected) = match engine {
+        Engine::Local(context) => {
+            run_whisper(context, &glued, speakers, language, progress, events, abort)?
+        }
+        Engine::Remote(remote) => {
+            run_remote(remote, &glued, speakers, language, progress, events, abort)?
+        }
+    };
     Ok((
         phrases(&words, &glued, speakers, track, paragraphs),
         detected,
@@ -1118,6 +1160,73 @@ fn run_whisper(
         flush(&mut current, &mut words);
     }
     Ok((words, detected))
+}
+
+/// The remote server sees one track, already cut down to the stretches with
+/// sound. Its timestamps are on that upload, so they go through the same map
+/// as whisper's. Word times are used when the server sends them; otherwise
+/// each segment is spread across its own span, and the speaker is still the
+/// track (You or Remote, or Speaker N for an import).
+fn run_remote(
+    remote: &crate::models::Remote,
+    glued: &Glued,
+    speakers: &Speakers,
+    language: &str,
+    progress: (f64, f64),
+    events: &Events,
+    abort: &Abort,
+) -> Result<(Vec<Word>, Option<String>), String> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    emit(events, Event::Stage("Sending audio".into()));
+    emit(events, Event::Progress(progress.0));
+    let transcript = crate::remote::fetch(
+        remote,
+        &glued.samples,
+        language,
+        crate::remote::Timeouts::for_audio(glued.samples.len()),
+        abort,
+    )?;
+    if abort.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    emit(events, Event::Progress(progress.1));
+    let words: Vec<Word> = transcript
+        .words
+        .iter()
+        .map(|word| Word {
+            text: word.text.clone(),
+            start_ms: word.start_ms,
+            end_ms: word.end_ms,
+            no_speech: word.no_speech,
+            segment: word.segment,
+        })
+        .collect();
+    let mut current: Option<(usize, String, i64, i64)> = None;
+    let flush = |current: &mut Option<(usize, String, i64, i64)>| {
+        if let Some((_, text, start_ms, end_ms)) = current.take() {
+            let (start_ms, _) = glued.locate(start_ms);
+            let (end_ms, _) = glued.locate(end_ms);
+            let speaker = speakers.speaker(start_ms, end_ms.max(start_ms));
+            emit(events, Event::Segment(format!("{speaker}: {text}")));
+        }
+    };
+    for word in &words {
+        match current.as_mut() {
+            Some((segment, text, _, end_ms)) if *segment == word.segment => {
+                text.push(' ');
+                text.push_str(&word.text);
+                *end_ms = word.end_ms.max(*end_ms);
+            }
+            _ => {
+                flush(&mut current);
+                current = Some((word.segment, word.text.clone(), word.start_ms, word.end_ms));
+            }
+        }
+    }
+    flush(&mut current);
+    Ok((words, transcript.language))
 }
 
 /// A pause longer than this starts a new paragraph, even for the same speaker.
@@ -1664,5 +1773,43 @@ mod tests {
         assert!(!voice_heard(Some(&heard), 30_000, 32_000));
         assert!(!voice_heard(Some(&[]), 0, 1_000));
         assert!(voice_heard(None, 0, 1_000));
+    }
+
+    #[test]
+    fn a_remote_track_keeps_its_speaker_and_a_timeline() {
+        let (url, _hit) = crate::remote::serve_once(
+            200,
+            "OK",
+            r#"{"language":"english","text":"Hello from the microphone","segments":[{"id":0,"text":"Hello from the microphone","start":0.2,"end":1.4,"no_speech_prob":0.05}]}"#.to_owned(),
+        );
+        let engine = Engine::Remote(crate::models::Remote {
+            url,
+            api_key: None,
+            model: "whisper-1".into(),
+        });
+        let samples = vec![0.2; WHISPER_RATE * 2];
+        let regions = vec![Region {
+            start: 0,
+            onset: 0,
+            end: samples.len(),
+        }];
+        let (tx, _rx) = async_channel::unbounded();
+        let (segments, detected) = side_pass(
+            &engine,
+            &samples,
+            &regions,
+            &Speakers::Side("You", Vec::new()),
+            "auto",
+            (0.0, 1.0),
+            true,
+            &tx,
+            &Abort::default(),
+        )
+        .unwrap();
+        assert_eq!(detected.as_deref(), Some("en"));
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker, "You");
+        assert!(segments[0].text.contains("Hello from the microphone"));
+        assert!(segments[0].end_ms > segments[0].start_ms);
     }
 }

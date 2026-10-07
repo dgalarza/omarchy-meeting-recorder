@@ -15,6 +15,7 @@ mod meeting;
 mod models;
 mod nemotron;
 mod player;
+mod remote;
 mod settings;
 mod theme;
 mod transcribe;
